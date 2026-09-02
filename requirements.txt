@@ -1,0 +1,4 @@
+requests
+python-dotenv
+upstox-python-sdk
+psycopg[binary]

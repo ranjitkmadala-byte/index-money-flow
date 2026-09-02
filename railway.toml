@@ -1,0 +1,6 @@
+[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "python index_money_flow_engine.py"
+restartPolicyType = "ALWAYS"
