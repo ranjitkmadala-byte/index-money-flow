@@ -387,7 +387,9 @@ def ensure_tables():
         symbol TEXT NOT NULL,
         money_flow_atm NUMERIC,
         spot NUMERIC,
+        spot_change_pct_t0 NUMERIC,
         future NUMERIC,
+        future_change_pct_t0 NUMERIC,
         future_basis NUMERIC,
         future_oi BIGINT,
         future_oi_change_t0 BIGINT,
@@ -477,6 +479,12 @@ def ensure_tables():
       ON public.index_option_snapshots(trading_date, symbol, ts);
     CREATE INDEX IF NOT EXISTS idx_index_aggression_date_symbol_ts
       ON public.index_futures_aggression_snapshots(trading_date, symbol, ts);
+
+    -- Backward-compatible migration for databases created by an older version.
+    ALTER TABLE public.index_engine_snapshots
+      ADD COLUMN IF NOT EXISTS spot_change_pct_t0 NUMERIC;
+    ALTER TABLE public.index_engine_snapshots
+      ADD COLUMN IF NOT EXISTS future_change_pct_t0 NUMERIC;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -665,6 +673,10 @@ def save_engine_snapshot(ctx, ts, snap):
 
     spot = safe_num(spotrow.get("ltp"))
     fut = safe_num(futrow.get("ltp"))
+    t0spot = safe_num((t0.get(ctx["spot_key"]) or {}).get("ltp"))
+    t0fut = safe_num((t0.get(ctx["future_key"]) or {}).get("ltp"))
+    spot_pct_t0 = (spot / t0spot - 1) * 100 if t0spot else 0
+    fut_pct_t0 = (fut / t0fut - 1) * 100 if t0fut else 0
     foi = safe_int(futrow.get("oi"))
     t0foi = safe_int((t0.get(ctx["future_key"]) or {}).get("oi"))
     doi_t0 = foi-t0foi
@@ -688,13 +700,16 @@ def save_engine_snapshot(ctx, ts, snap):
 
     sql = """
     INSERT INTO public.index_engine_snapshots(
-      trading_date,ts,symbol,money_flow_atm,spot,future,future_basis,future_oi,
+      trading_date,ts,symbol,money_flow_atm,spot,spot_change_pct_t0,
+      future,future_change_pct_t0,future_basis,future_oi,
       future_oi_change_t0,future_oi_change_pct_t0,future_oi_change_3m,
       call_oi,put_oi,call_oi_change_t0,put_oi_change_t0,call_oi_change_3m,put_oi_change_3m,
       pcr,call_iv,put_iv,call_fresh_value_cr,put_fresh_value_cr,oi_50pct_state
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT(trading_date,ts,symbol) DO UPDATE SET
-      spot=EXCLUDED.spot,future=EXCLUDED.future,future_oi=EXCLUDED.future_oi,
+      spot=EXCLUDED.spot,spot_change_pct_t0=EXCLUDED.spot_change_pct_t0,
+      future=EXCLUDED.future,future_change_pct_t0=EXCLUDED.future_change_pct_t0,
+      future_oi=EXCLUDED.future_oi,
       future_oi_change_t0=EXCLUDED.future_oi_change_t0,
       future_oi_change_pct_t0=EXCLUDED.future_oi_change_pct_t0,
       future_oi_change_3m=EXCLUDED.future_oi_change_3m,
@@ -704,7 +719,8 @@ def save_engine_snapshot(ctx, ts, snap):
       call_fresh_value_cr=EXCLUDED.call_fresh_value_cr,put_fresh_value_cr=EXCLUDED.put_fresh_value_cr,
       oi_50pct_state=EXCLUDED.oi_50pct_state;
     """
-    vals=(ts.date(),ts,ctx["symbol"],ctx["baseline_atm"],spot,fut,fut-spot,foi,doi_t0,doi_pct_t0,doi3,
+    vals=(ts.date(),ts,ctx["symbol"],ctx["baseline_atm"],spot,spot_pct_t0,
+          fut,fut_pct_t0,fut-spot,foi,doi_t0,doi_pct_t0,doi3,
           coi,poi,cchg,pchg,c3,p3,pcr,civ,piv,cfresh,pfresh,state50)
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -745,7 +761,8 @@ def save_engine_snapshot(ctx, ts, snap):
             conn.commit()
 
     log(
-        f"{ctx['symbol']} | spot={spot:.2f} fut={fut:.2f} OI T0={doi_pct_t0:+.2f}% "
+        f"{ctx['symbol']} | spot={spot:.2f} ({spot_pct_t0:+.2f}% T0) "
+        f"fut={fut:.2f} ({fut_pct_t0:+.2f}% T0) OI T0={doi_pct_t0:+.2f}% "
         f"| CEΔ={cchg:+,} PEΔ={pchg:+,} | {state50}"
     )
     ctx["prev_snapshot"] = deepcopy(snap)
