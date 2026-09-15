@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 import upstox_client
 
 # ============================================================
-# INDEX MONEY-FLOW + AGGRESSION ENGINE v1.0
+# INDEX MONEY-FLOW + AGGRESSION ENGINE v1.2 — INDEX-CALIBRATED STRUCTURE
 # NIFTY + BANKNIFTY
 # ============================================================
 # - Separate Railway service
@@ -345,6 +345,7 @@ def build_context(master, symbol, cfg):
         "baseline_future_value_cr": 0.0,
         "previous_pcr": None,
         "previous_live_flow_3m_cr": None,
+        "fresh_oi_persistence": 0,
     }
 
 def freeze_baseline(ctx):
@@ -438,6 +439,9 @@ def ensure_tables():
         options_flow_3m_cr NUMERIC,
         total_flow_3m_cr NUMERIC,
         money_flow_acceleration_3m_cr NUMERIC,
+        fresh_oi_persistence INTEGER NOT NULL DEFAULT 0,
+        fresh_oi_confirmation_points NUMERIC NOT NULL DEFAULT 0,
+        positioning_state TEXT,
         call_oi BIGINT,
         put_oi BIGINT,
         call_oi_change_t0 BIGINT,
@@ -536,6 +540,9 @@ def ensure_tables():
     ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS total_flow_3m_cr NUMERIC;
     ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS money_flow_acceleration_3m_cr NUMERIC;
     ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS pcr_change_3m NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS fresh_oi_persistence INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS fresh_oi_confirmation_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS positioning_state TEXT;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -739,6 +746,27 @@ def save_engine_snapshot(ctx, ts, snap):
     doi3_pct = doi3/prev_foi*100 if prev and prev_foi else 0
     fut_price_3m_pct = (fut/prev_fut-1)*100 if prev and prev_fut else 0
 
+    # NIFTY/BANKNIFTY index calibration:
+    # Fresh OI is POSITIONING evidence and is direction-neutral.
+    # +0.05% 3m OI = 1 point; 3 consecutive >= +0.05% = second point.
+    if doi3_pct >= 0.05:
+        ctx["fresh_oi_persistence"] = int(ctx.get("fresh_oi_persistence", 0)) + 1
+    else:
+        ctx["fresh_oi_persistence"] = 0
+    fresh_oi_persistence = ctx["fresh_oi_persistence"]
+    fresh_oi_confirmation_points = (
+        2.0 if fresh_oi_persistence >= 3
+        else 1.0 if doi3_pct >= 0.05
+        else 0.0
+    )
+
+    if fresh_oi_confirmation_points >= 2:
+        positioning_state = "OI BUILDING — DIRECTION UNRESOLVED"
+    elif fresh_oi_confirmation_points >= 1:
+        positioning_state = "FRESH OI"
+    else:
+        positioning_state = "NO MATERIAL FRESH OI"
+
     fut_now_vol=safe_int(futrow.get("volume")); fut_prev_vol=safe_int(prev_fut_row.get("volume")) if prev else fut_now_vol
     futures_flow_3m_cr=max(0,fut_now_vol-fut_prev_vol)*fut/10_000_000
     options_flow_rupees=0.0
@@ -775,9 +803,10 @@ def save_engine_snapshot(ctx, ts, snap):
       future,future_change_pct_t0,future_basis,future_oi,
       future_oi_change_t0,future_oi_change_pct_t0,future_oi_change_3m,
       future_oi_change_3m_pct,future_price_change_3m_pct,futures_flow_3m_cr,options_flow_3m_cr,total_flow_3m_cr,money_flow_acceleration_3m_cr,
+      fresh_oi_persistence,fresh_oi_confirmation_points,positioning_state,
       call_oi,put_oi,call_oi_change_t0,put_oi_change_t0,call_oi_change_3m,put_oi_change_3m,
       pcr,pcr_change_3m,call_iv,put_iv,call_fresh_value_cr,put_fresh_value_cr,oi_50pct_state
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT(trading_date,ts,symbol) DO UPDATE SET
       spot=EXCLUDED.spot,spot_change_pct_t0=EXCLUDED.spot_change_pct_t0,
       future=EXCLUDED.future,future_change_pct_t0=EXCLUDED.future_change_pct_t0,
@@ -787,6 +816,9 @@ def save_engine_snapshot(ctx, ts, snap):
       future_oi_change_3m=EXCLUDED.future_oi_change_3m,
       future_oi_change_3m_pct=EXCLUDED.future_oi_change_3m_pct,future_price_change_3m_pct=EXCLUDED.future_price_change_3m_pct,
       futures_flow_3m_cr=EXCLUDED.futures_flow_3m_cr,options_flow_3m_cr=EXCLUDED.options_flow_3m_cr,total_flow_3m_cr=EXCLUDED.total_flow_3m_cr,money_flow_acceleration_3m_cr=EXCLUDED.money_flow_acceleration_3m_cr,
+      fresh_oi_persistence=EXCLUDED.fresh_oi_persistence,
+      fresh_oi_confirmation_points=EXCLUDED.fresh_oi_confirmation_points,
+      positioning_state=EXCLUDED.positioning_state,
       call_oi_change_t0=EXCLUDED.call_oi_change_t0,put_oi_change_t0=EXCLUDED.put_oi_change_t0,
       call_oi_change_3m=EXCLUDED.call_oi_change_3m,put_oi_change_3m=EXCLUDED.put_oi_change_3m,
       pcr=EXCLUDED.pcr,pcr_change_3m=EXCLUDED.pcr_change_3m,call_iv=EXCLUDED.call_iv,put_iv=EXCLUDED.put_iv,
@@ -796,6 +828,7 @@ def save_engine_snapshot(ctx, ts, snap):
     vals=(ts.date(),ts,ctx["symbol"],ctx["baseline_atm"],spot,spot_pct_t0,
           fut,fut_pct_t0,fut-spot,foi,doi_t0,doi_pct_t0,doi3,doi3_pct,fut_price_3m_pct,
           futures_flow_3m_cr,options_flow_3m_cr,total_flow_3m_cr,money_flow_acceleration_3m_cr,
+          fresh_oi_persistence,fresh_oi_confirmation_points,positioning_state,
           coi,poi,cchg,pchg,c3,p3,pcr,pcr_change_3m,civ,piv,cfresh,pfresh,state50)
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
