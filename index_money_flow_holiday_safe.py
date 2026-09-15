@@ -343,6 +343,8 @@ def build_context(master, symbol, cfg):
         "baseline_put_value_cr": 0.0,
         "baseline_option_value_cr": 0.0,
         "baseline_future_value_cr": 0.0,
+        "previous_pcr": None,
+        "previous_live_flow_3m_cr": None,
     }
 
 def freeze_baseline(ctx):
@@ -430,6 +432,12 @@ def ensure_tables():
         future_oi_change_t0 BIGINT,
         future_oi_change_pct_t0 NUMERIC,
         future_oi_change_3m BIGINT,
+        future_oi_change_3m_pct NUMERIC,
+        future_price_change_3m_pct NUMERIC,
+        futures_flow_3m_cr NUMERIC,
+        options_flow_3m_cr NUMERIC,
+        total_flow_3m_cr NUMERIC,
+        money_flow_acceleration_3m_cr NUMERIC,
         call_oi BIGINT,
         put_oi BIGINT,
         call_oi_change_t0 BIGINT,
@@ -437,6 +445,7 @@ def ensure_tables():
         call_oi_change_3m BIGINT,
         put_oi_change_3m BIGINT,
         pcr NUMERIC,
+        pcr_change_3m NUMERIC,
         call_iv NUMERIC,
         put_iv NUMERIC,
         call_fresh_value_cr NUMERIC,
@@ -520,6 +529,13 @@ def ensure_tables():
       ADD COLUMN IF NOT EXISTS spot_change_pct_t0 NUMERIC;
     ALTER TABLE public.index_engine_snapshots
       ADD COLUMN IF NOT EXISTS future_change_pct_t0 NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS future_oi_change_3m_pct NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS future_price_change_3m_pct NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS futures_flow_3m_cr NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS options_flow_3m_cr NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS total_flow_3m_cr NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS money_flow_acceleration_3m_cr NUMERIC;
+    ALTER TABLE public.index_engine_snapshots ADD COLUMN IF NOT EXISTS pcr_change_3m NUMERIC;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -716,7 +732,25 @@ def save_engine_snapshot(ctx, ts, snap):
     t0foi = safe_int((t0.get(ctx["future_key"]) or {}).get("oi"))
     doi_t0 = foi-t0foi
     doi_pct_t0 = doi_t0/t0foi*100 if t0foi else 0
-    doi3 = foi-safe_int((prev.get(ctx["future_key"]) or {}).get("oi")) if prev else 0
+    prev_fut_row = (prev.get(ctx["future_key"]) or {}) if prev else {}
+    prev_foi = safe_int(prev_fut_row.get("oi")) if prev else 0
+    prev_fut = safe_num(prev_fut_row.get("ltp")) if prev else 0
+    doi3 = foi-prev_foi if prev else 0
+    doi3_pct = doi3/prev_foi*100 if prev and prev_foi else 0
+    fut_price_3m_pct = (fut/prev_fut-1)*100 if prev and prev_fut else 0
+
+    fut_now_vol=safe_int(futrow.get("volume")); fut_prev_vol=safe_int(prev_fut_row.get("volume")) if prev else fut_now_vol
+    futures_flow_3m_cr=max(0,fut_now_vol-fut_prev_vol)*fut/10_000_000
+    options_flow_rupees=0.0
+    if prev:
+        for key,meta in ctx["option_meta"].items():
+            if meta["strike"] not in ctx["call_strikes"] | ctx["put_strikes"]: continue
+            no=snap.get(key) or {}; oo=prev.get(key) or {}
+            options_flow_rupees += max(0,safe_int(no.get("volume"))-safe_int(oo.get("volume")))*safe_num(no.get("ltp"))
+    options_flow_3m_cr=options_flow_rupees/10_000_000
+    total_flow_3m_cr=futures_flow_3m_cr+options_flow_3m_cr
+    prev_flow=ctx.get("previous_live_flow_3m_cr")
+    money_flow_acceleration_3m_cr=total_flow_3m_cr-prev_flow if prev_flow is not None else 0.0
 
     coi = total_option_oi(ctx,snap,"CE")
     poi = total_option_oi(ctx,snap,"PE")
@@ -727,6 +761,8 @@ def save_engine_snapshot(ctx, ts, snap):
     c3 = coi-total_option_oi(ctx,prev,"CE") if prev else 0
     p3 = poi-total_option_oi(ctx,prev,"PE") if prev else 0
     pcr = poi/coi if coi else None
+    prev_pcr=ctx.get("previous_pcr")
+    pcr_change_3m=(pcr-prev_pcr) if pcr is not None and prev_pcr is not None else 0.0
     civ = average_metric(ctx,snap,"CE","iv")
     piv = average_metric(ctx,snap,"PE","iv")
     cfresh = fresh_value(ctx,snap,prev,"CE") if prev else 0
@@ -738,9 +774,10 @@ def save_engine_snapshot(ctx, ts, snap):
       trading_date,ts,symbol,money_flow_atm,spot,spot_change_pct_t0,
       future,future_change_pct_t0,future_basis,future_oi,
       future_oi_change_t0,future_oi_change_pct_t0,future_oi_change_3m,
+      future_oi_change_3m_pct,future_price_change_3m_pct,futures_flow_3m_cr,options_flow_3m_cr,total_flow_3m_cr,money_flow_acceleration_3m_cr,
       call_oi,put_oi,call_oi_change_t0,put_oi_change_t0,call_oi_change_3m,put_oi_change_3m,
-      pcr,call_iv,put_iv,call_fresh_value_cr,put_fresh_value_cr,oi_50pct_state
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+      pcr,pcr_change_3m,call_iv,put_iv,call_fresh_value_cr,put_fresh_value_cr,oi_50pct_state
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT(trading_date,ts,symbol) DO UPDATE SET
       spot=EXCLUDED.spot,spot_change_pct_t0=EXCLUDED.spot_change_pct_t0,
       future=EXCLUDED.future,future_change_pct_t0=EXCLUDED.future_change_pct_t0,
@@ -748,15 +785,18 @@ def save_engine_snapshot(ctx, ts, snap):
       future_oi_change_t0=EXCLUDED.future_oi_change_t0,
       future_oi_change_pct_t0=EXCLUDED.future_oi_change_pct_t0,
       future_oi_change_3m=EXCLUDED.future_oi_change_3m,
+      future_oi_change_3m_pct=EXCLUDED.future_oi_change_3m_pct,future_price_change_3m_pct=EXCLUDED.future_price_change_3m_pct,
+      futures_flow_3m_cr=EXCLUDED.futures_flow_3m_cr,options_flow_3m_cr=EXCLUDED.options_flow_3m_cr,total_flow_3m_cr=EXCLUDED.total_flow_3m_cr,money_flow_acceleration_3m_cr=EXCLUDED.money_flow_acceleration_3m_cr,
       call_oi_change_t0=EXCLUDED.call_oi_change_t0,put_oi_change_t0=EXCLUDED.put_oi_change_t0,
       call_oi_change_3m=EXCLUDED.call_oi_change_3m,put_oi_change_3m=EXCLUDED.put_oi_change_3m,
-      pcr=EXCLUDED.pcr,call_iv=EXCLUDED.call_iv,put_iv=EXCLUDED.put_iv,
+      pcr=EXCLUDED.pcr,pcr_change_3m=EXCLUDED.pcr_change_3m,call_iv=EXCLUDED.call_iv,put_iv=EXCLUDED.put_iv,
       call_fresh_value_cr=EXCLUDED.call_fresh_value_cr,put_fresh_value_cr=EXCLUDED.put_fresh_value_cr,
       oi_50pct_state=EXCLUDED.oi_50pct_state;
     """
     vals=(ts.date(),ts,ctx["symbol"],ctx["baseline_atm"],spot,spot_pct_t0,
-          fut,fut_pct_t0,fut-spot,foi,doi_t0,doi_pct_t0,doi3,
-          coi,poi,cchg,pchg,c3,p3,pcr,civ,piv,cfresh,pfresh,state50)
+          fut,fut_pct_t0,fut-spot,foi,doi_t0,doi_pct_t0,doi3,doi3_pct,fut_price_3m_pct,
+          futures_flow_3m_cr,options_flow_3m_cr,total_flow_3m_cr,money_flow_acceleration_3m_cr,
+          coi,poi,cchg,pchg,c3,p3,pcr,pcr_change_3m,civ,piv,cfresh,pfresh,state50)
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(sql,vals)
@@ -800,6 +840,8 @@ def save_engine_snapshot(ctx, ts, snap):
         f"fut={fut:.2f} ({fut_pct_t0:+.2f}% T0) OI T0={doi_pct_t0:+.2f}% "
         f"| CEΔ={cchg:+,} PEΔ={pchg:+,} | {state50}"
     )
+    ctx["previous_pcr"] = pcr
+    ctx["previous_live_flow_3m_cr"] = total_flow_3m_cr
     ctx["prev_snapshot"] = deepcopy(snap)
 
 class Aggression:
